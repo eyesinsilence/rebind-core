@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 """Program-verified numerical learning fixtures. Never reported as natural QA."""
 import csv,json,pathlib,random,time
 import numpy as np
@@ -11,7 +12,7 @@ from .train import set_loss,transition_loss
 def prepare_transitions(c):
     root=pathlib.Path(c['paths']['workdir']); data=pathlib.Path(c['paths']['data_root']); target=data/'transitions'; target.mkdir(exist_ok=True)
     from .retrieval import E5
-    encoder=E5(c['models']['retriever_path'],device='cuda:2'); builder=FeatureBuilder(encoder,c)
+    encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever')); builder=FeatureBuilder(encoder,c)
     examples=[]; rng=random.Random(719)
     names=['Mira','Jonas','Elena','Tariq','Nadia','Felix','Leila','Owen','Clara','Hugo','Sofia','Noah','Iris','Damon','Lena','Arun','Yara','Emil','Rina','Tomas','Anya','Malik','Esme','Ivan','Ada','Basil','Cora','Dario','Etta','Farid','Gia','Hadi']
     graph=QuestionGraph([dict(var_id='founder',description='person who led the project at its founding',type='person',is_answer=True),dict(var_id='current',description='current project lead',type='person'),dict(var_id='researcher',description='current researcher',type='person')],[dict(slot_id='founding',ordered_arguments=['founder'],relation_text='led at founding',dependencies=[],order=0)])
@@ -38,11 +39,11 @@ def prepare_transitions(c):
 def train_all(c):
     root=pathlib.Path(c['paths']['workdir']); data=pathlib.Path(c['paths']['data_root']); file=data/'transitions/controlled_micro.pt'
     if not file.exists(): raise Blocked('No prepared transitions')
-    examples=torch.load(file,weights_only=True); train=examples[:12]; dev=examples[12:]; device='cuda:2'; summaries=[]; curves=[]
+    examples=torch.load(file,weights_only=True); train=examples[:12]; dev=examples[12:]; device=resolve_device(c,'train'); summaries=[]; curves=[]
     # These weights remain under diagnostics, never promoted to natural-data checkpoints.
     for method in ['rebind','bp_rebind','independent_binding','no_revision_loss']:
         torch.manual_seed(17); mode='rebind' if method=='no_revision_loss' else method
-        model=ReBindModule(d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode).to(device)
+        model=ReBindModule(input_dim=examples[0]['after']['candidate'].shape[-1],d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode).to(device)
         opt=torch.optim.AdamW(model.parameters(),lr=c['train']['learning_rate'],weight_decay=c['train']['weight_decay']); output=data/'diagnostic_checkpoints_v4'/method/'17'; output.mkdir(parents=True,exist_ok=True)
         best=float('inf'); start=time.time()
         for epoch in range(21):

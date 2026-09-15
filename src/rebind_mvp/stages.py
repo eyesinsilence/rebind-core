@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 import collections,csv,importlib.util,json,pathlib,sys,time,os
 import numpy as np
 import torch
@@ -36,7 +37,7 @@ def run(name,c,args):
         write(reports/'data_audit.json',audit); return audit
     if name=='audit-retrieval':
         from .retrieval import Retriever,E5
-        encoder=E5(c['models']['retriever_path']); result={}
+        encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever')); result={}
         for ds in getattr(args,'datasets',None) or c['retrieval']['datasets']:
             r=Retriever(c,ds,encoder); rows=list(read_rows(data/'public'/ds/'dev.jsonl'))[:5]; checks=[]
             for row in rows:
@@ -84,7 +85,7 @@ def run_questions(stage,c,args):
     import inspect
     inference_files=[p for p in (root/'src/rebind_mvp').rglob('*.py') if p.name not in ['stages.py','cli.py','data.py','audit.py','train.py','diagnostics.py','interventions.py']]
     pipeline_hash=digest(dict(files={str(p.relative_to(root/'src')):digest(p) for p in inference_files},runner=inspect.getsource(run_questions)))
-    phase_dir=root/'runs'/('natural_'+stage+'_'+protocol); phase_dir.mkdir(exist_ok=True); generator=Generator(c); encoder=E5(c['models']['retriever_path'],device='cuda:3')
+    phase_dir=root/'runs'/('natural_'+stage+'_'+protocol); phase_dir.mkdir(exist_ok=True); generator=Generator(c); encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'))
     limit=getattr(args,'limit',None) or (c.get('execution',{}).get('diagnose_questions',200) if stage=='diagnose' else c.get('execution',{}).get('smoke_questions',16))
     if stage=='evaluate': limit=None
     methods=['ircot_native','ircot_common','json_rebind'] if stage=='diagnose' else c['methods']['internal']
@@ -93,7 +94,7 @@ def run_questions(stage,c,args):
         for mode in ['bp_rebind','rebind']:
             initial=data/'smoke_initialization'/mode/'initial.pt'; initial.parent.mkdir(parents=True,exist_ok=True)
             if not initial.exists():
-                torch.manual_seed(17); model=ReBindModule(d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode); torch.save(dict(model=model.state_dict(),scope='untrained_smoke'),initial)
+                torch.manual_seed(17); model=ReBindModule(input_dim=encoder_dimension(encoder),d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode); torch.save(dict(model=model.state_dict(),scope='untrained_smoke'),initial)
     if protocol=='fixed': methods=['direct_reader','json_rebind','bp_rebind','rebind']
     if getattr(args,'methods',None): methods=args.methods
     allowed={'ircot_native','ircot_common','direct_reader','json_rebind','bp_rebind','rebind','independent_binding','no_revision_loss','frozen_old_read','frozen_query_replay','pyrag'}
@@ -152,7 +153,7 @@ def run_questions(stage,c,args):
                 pred['model_response_keys']=[x['key'] for x in actual_calls]
                 pred.update(uncached_llm_calls=sum(not x['cache_hit'] for x in actual_calls),uncached_input_tokens=sum(x['input_tokens'] for x in actual_calls if not x['cache_hit']),uncached_output_tokens=sum(x['output_tokens'] for x in actual_calls if not x['cache_hit']),api_calls_with_unknown_output_tokens=sum(x.get('output_tokens_unknown',False) for x in actual_calls))
                 pred.update(llm_calls=len(actual_calls),llm_input_tokens=sum(x['input_tokens'] for x in actual_calls),llm_output_tokens=sum(x['output_tokens'] for x in actual_calls),cache_hits=sum(x['cache_hit'] for x in actual_calls))
-                pred.update(training_scope=neural.metadata.get('scope') if neural else 'frozen_baseline',training_data_hash=neural.metadata.get('data_hash') if neural else None,parameter_count=sum(p.numel() for p in neural.model.parameters()) if neural else None,process_peak_module_gpu_bytes=torch.cuda.max_memory_allocated('cuda:2') if neural else None)
+                pred.update(training_scope=neural.metadata.get('scope') if neural else 'frozen_baseline',training_data_hash=neural.metadata.get('data_hash') if neural else None,parameter_count=sum(p.numel() for p in neural.model.parameters()) if neural else None,process_peak_module_gpu_bytes=peak_memory(neural.device) if neural else None)
                 pred.update(training_status='untrained_smoke' if 'smoke_initialization' in str(checkpoint) else ('trained' if neural else 'frozen_baseline'))
                 pred.update(pipeline_hash=pipeline_hash,dataset=ds,split=split,protocol=protocol,training_seed=getattr(args,'seed',17) if neural else None,checkpoint_hash=digest(checkpoint) if neural else None,seconds=time.time()-start)
                 pred.update(official_scores(root,ds,pred['answer'],private[ex.qid]))

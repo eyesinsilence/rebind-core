@@ -13,7 +13,7 @@ def audit(records):
         attempted = set()
         for row in result.get('trace', []):
             counts['rounds'] += 1
-            if row.get('frontend_version') != 'action_bound_literal_provenance_v2':
+            if row.get('frontend_version') not in ['action_bound_literal_provenance_v2','candidate_identity_relation_constraints_v3']:
                 counts['legacy_or_unsupported_rounds'] += 1
                 continue
             counts['auditable_rounds'] += 1
@@ -23,7 +23,7 @@ def audit(records):
                 counts['scheduled_actions'] += 1
                 matching = [t for t in tasks if t.get('for_action') and t.get('query_key') == action.get('query_key')
                             and t.get('input_values') == action.get('input_values')]
-                if len(matching) != 1 or not tasks[0].get('for_action'):
+                if len(matching) != 1 or not tasks[0].get('for_action') or matching[0].get('input_candidate_ids') != action.get('input_candidate_ids'):
                     violations.append('Scheduled action has no unique first extraction task with matching inputs')
                 else:
                     counts['actions_with_matching_extraction'] += 1

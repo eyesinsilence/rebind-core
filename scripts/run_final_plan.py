@@ -2,6 +2,7 @@
 import argparse, collections, copy, datetime, inspect, json, pathlib, re, subprocess, sys, time
 import yaml
 from rebind_mvp.audit import digest, write, append
+from rebind_mvp.runtime import resolve_device
 
 
 def audit(c):
@@ -63,7 +64,7 @@ def audit(c):
                     if not any(x['key']==item['key'] for x in generations[qid]):generations[qid].append(item)
     ga=[];operator=[];identity_diffs=[];slot_counts=collections.Counter();activity_cache_misses=[]
     oldconfig=yaml.safe_load((baseline/'configs/frontier.yaml').read_text());selections=json.loads((parent/'manifests/adapt_qa_lock.json').read_text())['identity']['all_trained_selections']
-    torch.set_num_threads(8);model=ReBindModule(d=128,layers=4).eval();model.load_state_dict(torch.load(selections['rebind_s17']['path'],weights_only=True,map_location='cpu')['model'])
+    torch.set_num_threads(8);weights=torch.load(selections['rebind_s17']['path'],weights_only=True,map_location='cpu')['model'];model=ReBindModule(input_dim=weights['project.weight'].shape[1],d=c['rebind']['hidden_dim'],layers=c['rebind']['layers']).eval();model.load_state_dict(weights)
     for qid in sorted(graph_qids):
         i=int(qid.split('_')[1]);paths=[baseline/'runs/frontier_dev'/(qid+'_open_native_s17.json'),baseline/'runs/frontier_test'/(qid+'_open_native_s17.json'),parent/'runs/mquake_T_open'/(qid+'_rebind.json')];p=next((p for p in paths if p.exists()),None)
         if p is None:ga.append(dict(qid=qid,status='no_historical_trace',raw_generations=generations[qid],review='pending'));continue
@@ -151,7 +152,7 @@ def online(c,phase,partition,tag):
     h=digest(identity);lock=root/'manifests'/(stage+'_lock.json')
     if lock.exists():assert json.loads(lock.read_text())['identity']==identity,'Stage identity changed; retain old run and choose an explicit new tag'
     else:write(lock,dict(identity=identity,hash=h,time=time.time()))
-    (folder/'resolved_config.yaml').write_text(yaml.safe_dump(c,sort_keys=False));generator=Generator(c);encoder=E5(c['models']['retriever_path'],device='cuda:3');docs=json.loads((root/'data/memory/T.json').read_text());vectors=np.load(root/'data/memory/T_e5.npy')
+    (folder/'resolved_config.yaml').write_text(yaml.safe_dump(c,sort_keys=False));generator=Generator(c);encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'));docs=json.loads((root/'data/memory/T.json').read_text());vectors=np.load(root/'data/memory/T_e5.npy')
     def task(row):
         results=[];example=InferenceExample(row['qid'],row['question'])
         for spec in specs:

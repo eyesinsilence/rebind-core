@@ -1,4 +1,9 @@
 version: 1
+devices:
+  retriever: auto
+  generator: auto
+  scorer: auto
+  train: auto
 project: rebind_mquake_t
 paths:
   workdir: .
@@ -152,6 +157,7 @@ frontier_diagnostics:
   retraining: false
 
 final_plan:
+  relation_policy: strict
   baseline: external_runs/frontier
   seed: 20260915
   per_dev_group: 12

@@ -20,6 +20,8 @@ def constraint_penalty(graph,domain,prefix):
     import datetime,re,calendar
     variables=list(domain); chosen={v:domain[v][prefix[i]] for i,v in enumerate(variables[:len(prefix)])}
     for v,candidate in chosen.items():
+        for upstream,cid in candidate.get('input_candidate_ids',{}).items():
+            if upstream in chosen and chosen[upstream]['candidate_id']!=cid:return float('-inf')
         for upstream,surface in candidate.get('input_values',{}).items():
             if upstream in chosen and chosen[upstream]['surface']!=surface:return float('-inf')
     for condition in graph.constraints:
@@ -37,7 +39,7 @@ def constraint_penalty(graph,domain,prefix):
         if len(args)!=2 or any(a not in chosen for a in args): continue
         a,b=[chosen[v] for v in args]
         if a['candidate_id']=='UNKNOWN' or b['candidate_id']=='UNKNOWN': continue
-        if kind=='inequality' and a['identity']==b['identity']: return float('-inf')
+        if kind=='inequality' and (a['identity']==b['identity'] or (a.get('entity_identity_verified') and b.get('entity_identity_verified') and a.get('entity_id')==b.get('entity_id'))): return float('-inf')
         if kind=='equality' and a.get('entity_identity_verified') and b.get('entity_identity_verified') and a.get('entity_id')!=b.get('entity_id'): return float('-inf')
         # Distinct source-local mentions do not prove different entities.
         if kind in ['before','after']:

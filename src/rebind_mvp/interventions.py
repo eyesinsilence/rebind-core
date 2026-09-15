@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 import json,pathlib
 import torch
 from .source_reader import ReBindModule
@@ -7,12 +8,12 @@ def run_interventions(c):
     root=pathlib.Path(c['paths']['workdir']); data=pathlib.Path(c['paths']['data_root']); records=[]
     checkpoint=data/'diagnostic_checkpoints_v4/rebind/17/best.pt'
     if not checkpoint.exists(): raise Blocked('No trained diagnostic checkpoint available')
-    examples=torch.load(data/'transitions/controlled_micro.pt',weights_only=True); model=ReBindModule(d=c['rebind']['hidden_dim'],layers=c['rebind']['layers']).eval().to('cuda:2'); model.load_state_dict(torch.load(checkpoint,weights_only=True,map_location='cuda:2')['model'])
+    examples=torch.load(data/'transitions/controlled_micro.pt',weights_only=True); model=ReBindModule(input_dim=examples[0]['after']['candidate'].shape[-1],d=c['rebind']['hidden_dim'],layers=c['rebind']['layers']).eval().to(resolve_device(c,'scorer')); model.load_state_dict(torch.load(checkpoint,weights_only=True,map_location=resolve_device(c,'scorer'))['model'])
     with torch.no_grad():
         for example in examples[12:]:
-            before={k:v.to('cuda:2') for k,v in example['before'].items()}; after={k:v.to('cuda:2') for k,v in example['after'].items()}
+            before={k:v.to(resolve_device(c,'scorer')) for k,v in example['before'].items()}; after={k:v.to(resolve_device(c,'scorer')) for k,v in example['after'].items()}
             old=model(**before); normal=model(**after)
-            oldmask=torch.tensor([True,False],device='cuda:2'); scores=normal['source'].clone(); values=normal['source_values'].clone(); scores[0]=old['source'][0]; values[0]=old['source_values'][0]
+            oldmask=torch.tensor([True,False],device=resolve_device(c,'scorer')); scores=normal['source'].clone(); values=normal['source_values'].clone(); scores[0]=old['source'][0]; values[0]=old['source_values'][0]
             frozen=model(**after,freeze=(oldmask,scores,values,torch.cat([old['source_special'],normal['source_special'][1:]],0)))
             row=dict(group_id=example['group_id'],scope='controlled_inference_lesion_only',checkpoint_hash=digest(checkpoint),label=example['target'],before_prediction=int(old['unary'][0].argmax()),normal_prediction=int(normal['unary'][0].argmax()),frozen_old_source_prediction=int(frozen['unary'][0].argmax()),old_source_score_delta=(normal['source'][0]-old['source'][0]).cpu().tolist(),open_queries_run=False)
             records.append(row);append(root/'reports/interventions.jsonl',row)
@@ -31,7 +32,7 @@ def run_natural_forks(c,controlled):
     import concurrent.futures,copy,time
     root=pathlib.Path(c['paths']['workdir']); data=pathlib.Path(c['paths']['data_root']); checkpoint=data/'checkpoints/rebind/17/best.pt'
     if not checkpoint.exists(): return dict(status='controlled_only',controlled=controlled,natural_forks='checkpoint_missing')
-    directory=root/'runs/intervention_forks'; directory.mkdir(exist_ok=True); generator=Generator(c); encoder=E5(c['models']['retriever_path'],device='cuda:3'); pairs=[]
+    directory=root/'runs/intervention_forks'; directory.mkdir(exist_ok=True); generator=Generator(c); encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever')); pairs=[]
     for ds in c['retrieval']['datasets']:
         retriever=Retriever(c,ds,encoder); rows=list(read_rows(data/'public'/ds/'eval.jsonl'))[:16]; private={r['qid']:r for r in read_rows(data/'private'/ds/'eval.jsonl')}
         def process(row):

@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 """Offline partial supervision and one equal-budget adaptation of deployed prefixes.
 
 Private reference triples are read only by prepare(); never inserted into features.
@@ -101,7 +102,7 @@ def prepare(c,shard):
                 seen.add(key);labels,audit=prefix_labels(t,raw[record['case_id']]['new_triples_labeled'])
                 featurekey=digest(dict(feature_version='centered_window_v2',cache_context=dict(qid=record['qid'],split=stage),question=record['compile_audit']['question'],graph=t['graph'],candidates=t['candidates'],docs=t['proposal']['visible'],proposal=t['proposal'],config=config));feature=root/'data/features'/(featurekey+'.pt')
                 if not feature.exists():
-                    if encoder is None:encoder=E5(c['models']['retriever_path'],device='cuda:0')
+                    if encoder is None:encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'))
                     builder.encoder=encoder;registry=CandidateRegistry(t['graph']['variables'])
                     registry.pool={v:{x['candidate_id']:x for x in xs} for v,xs in t['candidates'].items()};registry.active={v:[x['candidate_id'] for x in xs] for v,xs in t['candidates'].items()}
                     builder.build(record['compile_audit']['question'],QuestionGraph(**t['graph']),registry,t['proposal']['visible'],t['proposal'],dict(qid=record['qid'],split=stage));counts['feature_cache_misses']+=1
@@ -152,9 +153,9 @@ def train(c,method,seed,epochs=5):
     from .adapt import BatchedReBind
     from .joint_decoder import decode,constraint_penalty
     from .schema import QuestionGraph
-    root=pathlib.Path(c['paths']['workdir']);directory=root/'data/final_alignment';outdir=directory/method/str(seed);outdir.mkdir(parents=True,exist_ok=True);device='cuda:0';torch.set_num_threads(2);torch.manual_seed(seed)
+    root=pathlib.Path(c['paths']['workdir']);directory=root/'data/final_alignment';outdir=directory/method/str(seed);outdir.mkdir(parents=True,exist_ok=True);device=resolve_device(c,'train');torch.set_num_threads(2);torch.manual_seed(seed)
     manifests=[json.loads((directory/f'prepare_{s}.json').read_text()) for s in range(4)];rows=[r for m in manifests for r in m['rows']];payloads={r['path']:torch.load(r['path'],weights_only=True,map_location='cpu') for r in rows};features={p['feature']:torch.load(p['feature'],weights_only=True,map_location='cpu') for p in payloads.values()};split={s:[p for p in payloads.values() if p['split']==s and p['labels']['mask'].any()] for s in ['train','dev']};assert split['train'] and split['dev'];assert {p['group'] for p in split['train']}.isdisjoint({p['group'] for p in split['dev']})
-    selection=json.loads((pathlib.Path(c['diagnostics']['parent'])/'manifests/adapt_qa_lock.json').read_text())['identity']['all_trained_selections'][f'{method}_s{seed}'];model=BatchedReBind(d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=method).to(device);model.load_state_dict(torch.load(selection['path'],weights_only=True,map_location=device)['model']);opt=torch.optim.AdamW(model.parameters(),lr=3e-5,weight_decay=.01)
+    selection=json.loads((pathlib.Path(c['diagnostics']['parent'])/'manifests/adapt_qa_lock.json').read_text())['identity']['all_trained_selections'][f'{method}_s{seed}'];model=BatchedReBind(input_dim=next(iter(features.values()))['candidate'].shape[-1],d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=method).to(device);model.load_state_dict(torch.load(selection['path'],weights_only=True,map_location=device)['model']);opt=torch.optim.AdamW(model.parameters(),lr=3e-5,weight_decay=.01)
     identity=dict(method=method,seed=seed,epochs=epochs,learning_rate=3e-5,batch_size=16,initial=selection,prefix_manifests=[digest(directory/f'prepare_{s}.json') for s in range(4)],code=digest(pathlib.Path(__file__)),batched_code=digest(root/'src/rebind_mvp/adapt.py'),supervision='unary + .25 pair + .25 positive source interpretation + .1 stable + .5 new-evidence correction opportunity',frontier_loss=False)
     lock=outdir/'lock.json'
     if lock.exists():raise ValueError('Training track already exists; preserve it, inspect completion before restarting')
@@ -209,6 +210,6 @@ def train(c,method,seed,epochs=5):
             if not training:stats[name].update(joint_binding_correct=joint_correct,joint_binding_accuracy=joint_correct/count,joint_repairs_vs_collected=joint_repairs,joint_harms_vs_collected=joint_harms)
         checkpoint=outdir/f'epoch_{epoch}.pt';torch.save(dict(model=model.state_dict(),method=method,seed=seed,epoch=epoch,updates=updates,identity=identity,metrics=stats),checkpoint)
         if stats['dev']['loss']<best[0]:best=(stats['dev']['loss'],str(checkpoint))
-        record=dict(epoch=epoch,updates=updates,stats=stats,seconds=time.time()-started,gradient_heads=sorted(gradient_heads),gpu_peak_bytes=torch.cuda.max_memory_allocated());epoch_results.append(record);append(outdir/'learning_curve.jsonl',record);print(json.dumps(record),flush=True)
+        record=dict(epoch=epoch,updates=updates,stats=stats,seconds=time.time()-started,gradient_heads=sorted(gradient_heads),gpu_peak_bytes=peak_memory(device));epoch_results.append(record);append(outdir/'learning_curve.jsonl',record);print(json.dumps(record),flush=True)
     result=dict(method=method,seed=seed,updates=updates,epochs=epochs,best_masked_dev_checkpoint=best[1],selection_status='provisional; deployed dev QA and binding-harm comparison with epoch0 required before final lock',gradient_heads=sorted(gradient_heads),frontier_gradient='frontier' in gradient_heads,rows={s:len(v) for s,v in split.items()},results=epoch_results,identity=identity)
     assert not result['frontier_gradient'];write(outdir/'completion.json',result);return result

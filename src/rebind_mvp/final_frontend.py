@@ -8,6 +8,7 @@ from .audit import digest, write
 from .schema import QuestionGraph, CandidateRegistry
 from .joint_decoder import constraint_penalty
 from .evaluate import run_loop, JSON_STATE_PROMPT
+from .assignments import validated_state,check_relation
 
 GRAPH_PROMPT='''Compile ONLY the question into a complete executable directed relation graph. Do not solve any relation or invent an entity. Every nested relation that must be solved must be a separate slot, never hidden in a variable description. Include literal question entities as anchored variables. Keep time, role and scope restrictions. Direct questions may have one slot; nested questions need the actual full path. All edges go from known input arguments to one unknown output (LAST argument). Each output is produced by only one slot. Use the existing schema:
 {"variables":[{"var_id":"answer","type":"entity","description":"requested role","is_answer":true},{"var_id":"x0","type":"entity","description":"literal question entity","is_answer":false,"anchor":"literal substring"},{"var_id":"v0","type":"entity","description":"intermediate role","is_answer":false}],"slots":[{"slot_id":"s0","ordered_arguments":["x0","v0"],"relation_text":"first required relation","dependencies":[],"order":0,"query_template":"first required relation of {x0}"},{"slot_id":"s1","ordered_arguments":["v0","answer"],"relation_text":"second required relation","dependencies":["s0"],"order":1,"query_template":"second required relation of {v0}"}],"constraints":[]}
@@ -71,27 +72,21 @@ def compile_graph(generator,example,config):
     write(path.with_suffix('.failed.json'),dict(attempts=attempts));raise ValueError('Question compilation failed after two attempts: '+str(attempts))
 
 
-def supported_assignments(graph,registry,state):
-    domain=registry.snapshot();anchors={v['var_id']:v['anchor'] for v in graph.variables if v.get('anchor')};out=[]
-    for assignment in state.get('assignments',[]) or [anchors]:
-        current=dict(anchors)
-        for slot in graph.slots:
-            inputs={v:current.get(v,'UNKNOWN') for v in slot['ordered_arguments'][:-1]};v=slot['ordered_arguments'][-1];value=assignment.get(v,'UNKNOWN')
-            matching=[x for x in domain[v] if x['surface']==value and x.get('slot_id')==slot['slot_id'] and x.get('input_values')==inputs]
-            current[v]=value if all(x!='UNKNOWN' for x in inputs.values()) and matching else 'UNKNOWN'
-        if current not in out:out.append(current)
-    return out
+def supported_assignments(graph,registry,state,relation_policy='literal'):
+    return validated_state(graph,registry,state,relation_policy)['assignments']
 
 
-FRONTEND_VERSION = 'action_bound_literal_provenance_v2'
+FRONTEND_VERSION = 'candidate_identity_relation_constraints_v3'
 
 
-def relation_task(slot, inputs, evidence_version=None):
+def relation_task(slot, inputs, evidence_version=None, input_candidate_ids=None):
     """Separate a bounded retrieval identity from evidence-specific extraction."""
     inputs = copy.deepcopy(inputs)
-    query_key = digest(dict(slot=slot['slot_id'], inputs=inputs, scope=slot.get('scope')))
+    identity=dict(slot=slot['slot_id'], inputs=inputs, scope=slot.get('scope'))
+    if input_candidate_ids is not None:identity['input_candidate_ids']=input_candidate_ids
+    query_key = digest(identity)
     key = digest(dict(query_key=query_key, evidence_version=evidence_version))
-    return dict(slot_id=slot['slot_id'], inputs=inputs, input_values=copy.deepcopy(inputs),
+    return dict(slot_id=slot['slot_id'], inputs=inputs, input_values=copy.deepcopy(inputs),input_candidate_ids=copy.deepcopy(input_candidate_ids),
                 scope=copy.deepcopy(slot.get('scope')), evidence_version=evidence_version,
                 query_key=query_key, key=key)
 
@@ -103,34 +98,36 @@ def visible_evidence_version(visible):
     return digest(sorted(identities, key=digest))
 
 
-def extraction_tasks(graph, assignments, action, evidence_version):
+def extraction_tasks(graph, assignments, action, evidence_version, candidate_assignments=None):
     """The queried branch comes first, even if it is absent from current top-1."""
     tasks = []
     seen = set()
     slots = {s['slot_id']: s for s in graph.slots}
 
-    def add(slot, inputs, for_action=False):
+    def add(slot, inputs, for_action=False, input_candidate_ids=None):
         if any(value == 'UNKNOWN' for value in inputs.values()):
             return
-        task = relation_task(slot, inputs, evidence_version)
+        task = relation_task(slot, inputs, evidence_version,input_candidate_ids)
         if task['key'] not in seen:
             seen.add(task['key'])
             tasks.append(dict(task, for_action=for_action))
 
     if action is not None:
-        add(slots[action['slot_id']], action['input_values'], True)
+        add(slots[action['slot_id']], action['input_values'], True,action.get('input_candidate_ids'))
     for slot in graph.slots:
-        for binding in assignments:
-            add(slot, {v: binding.get(v, 'UNKNOWN') for v in slot['ordered_arguments'][:-1]})
+        for index,binding in enumerate(assignments):
+            ids={v:candidate_assignments[index][v] for v in slot['ordered_arguments'][:-1]} if candidate_assignments is not None else None
+            add(slot, {v: binding.get(v, 'UNKNOWN') for v in slot['ordered_arguments'][:-1]},input_candidate_ids=ids)
     return tasks
 
 
-def next_action(graph,assignments,executed,evidence_version=None):
+def next_action(graph,assignments,executed,evidence_version=None,candidate_assignments=None):
     for slot in graph.slots:
-        for binding in assignments:
+        for index,binding in enumerate(assignments):
             inputs={v:binding.get(v,'UNKNOWN') for v in slot['ordered_arguments'][:-1]}
             if any(x=='UNKNOWN' for x in inputs.values()):continue
-            task=relation_task(slot,inputs,evidence_version)
+            ids={v:candidate_assignments[index][v] for v in inputs} if candidate_assignments is not None else None
+            task=relation_task(slot,inputs,evidence_version,ids)
             if task['query_key'] in executed or task['key'] in executed:continue
             template=slot.get('query_template','');fields=re.findall(r'\{([^{}]+)\}',template)
             query=template.format(**inputs) if fields and set(fields)==set(inputs) else slot['relation_text']+' '+' '.join(inputs.values())
@@ -138,7 +135,7 @@ def next_action(graph,assignments,executed,evidence_version=None):
     return None
 
 
-def add_candidate(registry,var,surface,kind,slot,inputs,round_index,doc=None,quote=None,relation=None):
+def add_candidate(registry,var,surface,kind,slot,inputs,round_index,doc=None,quote=None,relation=None,input_candidate_ids=None):
     origins=[];sourceids=[];provenance=[]
     if not isinstance(surface,str) or not surface.strip() or surface=='UNKNOWN':
         raise ValueError('Candidate must be a nonempty, named value')
@@ -154,17 +151,20 @@ def add_candidate(registry,var,surface,kind,slot,inputs,round_index,doc=None,quo
         provenance=[dict(span_id=span_id,doc_id=doc['doc_id'],char_start=start,char_end=start+len(quote),
                          quote=quote,title_context=doc.get('title',''),verification_level='literal_provenance')]
     elif kind not in ['question_anchor','parametric_hypothesis']:raise ValueError('Unknown provenance kind')
-    identity=[kind,slot,inputs,surface,sourceids];cid=registry.add(var,surface,identity,origins,round_index)
+    identity=[kind,slot,inputs,surface,sourceids]
+    if input_candidate_ids is not None:identity.append(input_candidate_ids)
+    cid=registry.add(var,surface,identity,origins,round_index)
     candidate=registry.pool[var][cid]
     records={p['span_id']:p for p in candidate.get('provenance_records',[])}
     records.update({p['span_id']:p for p in provenance})
     candidate.update(origin_kind=kind,source_doc_ids=sourceids,slot_id=slot,input_values=copy.deepcopy(inputs),
-                     literal_provenance=kind=='retrieved',relation_checked=False,
+                     literal_provenance=kind=='retrieved',relation_checked=False,relation_supported=False,
                      verification_level={'retrieved':'literal_provenance','question_anchor':'question_anchor',
                                          'parametric_hypothesis':'unverified_hypothesis'}[kind],
                      verified=kind=='question_anchor',provenance_records=list(records.values()),
                      relation_claim=dict(slot_id=slot,input_values=copy.deepcopy(inputs),output_value=surface,
                                          relation=copy.deepcopy(relation),status='not_checked'))
+    if input_candidate_ids is not None:candidate['input_candidate_ids']=copy.deepcopy(input_candidate_ids)
     return cid
 
 
@@ -172,6 +172,8 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
     started=time.time();start_calls=len(generator.calls);context=generator.context.copy();components=dict(config.get('component_versions',{}));trace=[];errors=[];docs={};executed=set();hypotheses=set();raw='';graph=None;state={};queries=[]
     components['frontend_execution']=FRONTEND_VERSION
     extraction_attempts={}
+    relation_policy=config.get('final_plan',{}).get('relation_policy','literal')
+    if relation_policy not in ['literal','strict']:raise ValueError('Unknown relation policy')
     def stage(name):generator.context={**context,'stage':name,'components':components,'updater':method if name in ['state','reader'] else 'shared','checkpoint':getattr(neural,'checkpoint_hash',None) if name in ['state','reader'] else None}
     stage('parser')
     try:graph,compile_audit=compile_graph(generator,example,config)
@@ -191,8 +193,9 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
                                              action_key=action['key'] if action else None,
                                              query_key=action['query_key'] if action else None))
         if action:executed.add(action['query_key'])
-        bindings=supported_assignments(graph,registry,state);accepted=[];rejected=[]
-        for execution in extraction_tasks(graph,bindings,action,evidence_version):
+        state=validated_state(graph,registry,state,relation_policy)
+        bindings=state['assignments'];accepted=[];rejected=[]
+        for execution in extraction_tasks(graph,bindings,action,evidence_version,state['candidate_assignments']):
             slot=next(s for s in graph.slots if s['slot_id']==execution['slot_id'])
             inputs=execution['input_values'];var=slot['ordered_arguments'][-1]
             if execution['key'] in extraction_attempts:
@@ -203,7 +206,8 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
                 # Keep the same quote-centered feature inputs when the visible evidence is unchanged.
                 accepted.extend(copy.deepcopy(previous['accepted']))
                 continue
-            task=dict(relation=slot['relation_text'],known_inputs=inputs,scope=slot.get('scope'),requested_role=next(v['description'] for v in graph.variables if v['var_id']==var));found=[]
+            input_context={v:registry.pool[v][cid] for v,cid in (execution.get('input_candidate_ids') or {}).items()}
+            task=dict(relation=slot['relation_text'],known_inputs=inputs,known_input_candidates=input_context,scope=slot.get('scope'),requested_role=next(v['description'] for v in graph.variables if v['var_id']==var));found=[]
             task_record=dict(execution,attempted=True,completed=False,status='failed',produced_candidates=False)
             accepted_start=len(accepted);rejected_start=len(rejected)
             stage('proposal')
@@ -216,12 +220,16 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
                     try:
                         if not isinstance(item,dict):raise ValueError('Candidate must be an object')
                         doc=next((d for d in visible if d['doc_id']==item.get('doc_id') and isinstance(item.get('quote'),str) and item['quote'] in d['text']),None)
-                        cid=add_candidate(registry,var,item['surface'],'retrieved',slot['slot_id'],inputs,round_index,doc,item.get('quote'),relation=slot);found.append(cid)
+                        cid=add_candidate(registry,var,item['surface'],'retrieved',slot['slot_id'],inputs,round_index,doc,item.get('quote'),relation=slot,input_candidate_ids=execution.get('input_candidate_ids'));found.append(cid)
                         candidate=registry.pool[var][cid];quote=item['quote'];start=doc['offsets'][0]+doc['text'].index(quote)
+                        if relation_policy=='strict':
+                            stage('relation_validation');verdict=check_relation(generator,slot,inputs,item['surface'],doc,quote,input_context)
+                            candidate.update({k:verdict[k] for k in ['relation_checked','relation_supported','verification_level']})
+                            candidate['relation_verification']=verdict;stage('proposal')
                         accepted.append(dict(var_id=var,surface=item['surface'],doc_id=doc['doc_id'],quote=quote,
                             span_id=digest([doc['doc_id'],start,quote]),candidate_id=cid,char_start=start,char_end=start+len(quote),
                             slot_id=slot['slot_id'],input_values=copy.deepcopy(inputs),task_key=execution['key'],
-                            evidence_version=evidence_version,verification_level=candidate['verification_level'],relation_checked=False))
+                            evidence_version=evidence_version,verification_level=candidate['verification_level'],relation_checked=candidate['relation_checked'],relation_supported=candidate['relation_supported'],input_candidate_ids=copy.deepcopy(execution.get('input_candidate_ids'))))
                     except (ValueError,KeyError,TypeError) as error:rejected.append(dict(item=item,task_key=execution['key'],error=repr(error)))
                 task_record.update(completed=True,status='completed')
             except (ValueError,KeyError,TypeError) as error:
@@ -230,7 +238,7 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
             task_record.update(produced_candidates=bool(found),candidate_ids=found[:],rejected_candidates=len(rejected)-rejected_start)
             record['extraction_tasks'].append(task_record)
             extraction_attempts[execution['key']]=dict(task_record,accepted=copy.deepcopy(accepted[accepted_start:]))
-            hkey=digest([slot['slot_id'],inputs]);is_answer=next(v.get('is_answer',False) for v in graph.variables if v['var_id']==var)
+            hkey=execution['query_key'];is_answer=next(v.get('is_answer',False) for v in graph.variables if v['var_id']==var)
             if knowledge=='hybrid' and not found and not is_answer and hkey not in hypotheses:
                 hypotheses.add(hkey);stage('hypothesis')
                 try:
@@ -238,22 +246,21 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
                     reply=generator.json(prompt,max_tokens=128)
                     for surface in reply.get('values',[])[:2]:
                         if isinstance(surface,str) and surface.strip() and surface!='UNKNOWN':
-                            cid=add_candidate(registry,var,surface,'parametric_hypothesis',slot['slot_id'],inputs,round_index);record['candidate_events'].append(dict(candidate_id=cid,origin_kind='parametric_hypothesis',slot=slot['slot_id'],inputs=inputs,surface=surface,origin_span_ids=[]))
+                            cid=add_candidate(registry,var,surface,'parametric_hypothesis',slot['slot_id'],inputs,round_index,input_candidate_ids=execution.get('input_candidate_ids'));record['candidate_events'].append(dict(candidate_id=cid,origin_kind='parametric_hypothesis',slot=slot['slot_id'],inputs=inputs,surface=surface,origin_span_ids=[]))
                 except (ValueError,KeyError,TypeError) as error:record['policy_errors'].append(dict(stage='hypothesis',slot=slot['slot_id'],error=repr(error)))
             record['candidate_events'] += [dict(candidate_id=cid,origin_kind='retrieved',slot=slot['slot_id'],inputs=inputs) for cid in found]
         before=copy.deepcopy(state);stage('state')
         try:
             if method=='json_fix':
-                domain=registry.snapshot();compact={v:[{k:x.get(k) for k in ['surface','origin_kind','slot_id','input_values','source_doc_ids','verification_level','relation_checked']} for x in xs] for v,xs in domain.items()}
+                domain=registry.snapshot();compact={v:[{k:x.get(k) for k in ['candidate_id','surface','origin_kind','slot_id','input_values','input_candidate_ids','source_doc_ids','verification_level','relation_checked','relation_supported']} for x in xs] for v,xs in domain.items()}
                 prompt=JSON_STATE_PROMPT+'Keep anchors fixed. A parametric_hypothesis is tentative knowledge, never source evidence. literal_provenance only checks quoted text; it does not verify a relationship, its direction or scope. A downstream candidate is usable only when its input_values match the current upstream bindings. Prefer a directly stated update over conflicting remembered hypotheses.\nQuestion: '+example.question+'\nGraph: '+json.dumps(asdict(graph))+'\nCandidates: '+json.dumps(compact)+'\nPrevious state: '+json.dumps(state)+'\nDocuments:\n'+raw
-                schema={'type':'object','properties':{'assignments':{'type':'array','minItems':1,'maxItems':2,'items':{'type':'object','properties':{v:{'type':'string','enum':[x['surface'] for x in xs]} for v,xs in domain.items()},'required':list(domain),'additionalProperties':False}}},'required':['assignments']}
-                prompt=prompt.replace(JSON_STATE_PROMPT,'Select at most two consistent joint bindings. Output ONLY {"assignments":[{"variable_id":"candidate surface"}]}; no explanations or other fields. ')
-                proposed=generator.json(prompt,max_tokens=512,schema=schema);state=dict(assignments=supported_assignments(graph,registry,proposed),status='inferred_or_unresolved')
+                schema={'type':'object','properties':{'candidate_assignments':{'type':'array','minItems':1,'maxItems':2,'items':{'type':'object','properties':{v:{'type':'string','enum':[x['candidate_id'] for x in xs]} for v,xs in domain.items()},'required':list(domain),'additionalProperties':False}}},'required':['candidate_assignments']}
+                prompt=prompt.replace(JSON_STATE_PROMPT,'Select at most two consistent joint bindings using candidate IDs, never names as identifiers. Output ONLY {"candidate_assignments":[{"variable_id":"candidate_id"}]}; no explanations or other fields. ')
+                proposed=generator.json(prompt,max_tokens=768,schema=schema);state=validated_state(graph,registry,proposed,relation_policy)
             else:state=neural.update(example,graph,registry,dict(accepted=accepted,rejected=rejected,visible=visible),visible,round_index)
         except (ValueError,KeyError,TypeError) as error:record['policy_errors'].append(dict(stage='state',error=repr(error)));state=before
-        binding=supported_assignments(graph,registry,state);state['assignments']=binding
-        if not binding:state['assignments']=supported_assignments(graph,registry,{})
-        action=next_action(graph,state['assignments'],executed,evidence_version)
+        state=validated_state(graph,registry,state,relation_policy)
+        action=next_action(graph,state['assignments'],executed,evidence_version,state['candidate_assignments'])
         record.update(candidates=registry.snapshot(),state=copy.deepcopy(state),next_action=action,proposal=dict(accepted=accepted,rejected=rejected,visible=visible))
         trace.append(record);errors+=record['policy_errors']
         if action is None:break

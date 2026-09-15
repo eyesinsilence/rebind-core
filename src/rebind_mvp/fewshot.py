@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 """Exploratory few-shot and same-evidence diagnostics; no training or test-driven selection."""
 import argparse,collections,csv,inspect,json,os,pathlib,time,traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -51,7 +52,7 @@ def run(c,smoke=False):
     h=digest(identity);lock=root/'manifests'/('diagnostics_'+scope+'_lock.json')
     if lock.exists():assert json.loads(lock.read_text())['identity']==identity
     else:write(lock,dict(identity=identity,hash=h,time=time.time()))
-    generator=Generator(c);few=FewShotGenerator(c,demos['text']);encoder=E5(c['models']['retriever_path'],device='cuda:3');docs=json.loads((data/'memory/T.json').read_text());vectors=np.load(data/'memory/T_e5.npy')
+    generator=Generator(c);few=FewShotGenerator(c,demos['text']);encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'));docs=json.loads((data/'memory/T.json').read_text());vectors=np.load(data/'memory/T_e5.npy')
     def task(row):
         ex=InferenceExample(row['qid'],row['question']);cache={};outputs=[]
         context=dict(qid=ex.qid,split='diagnostics_'+scope,source_hash=identity['memory_hash'])

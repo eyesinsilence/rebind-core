@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 """Frozen-checkpoint transfer to the official all-edited MQuAKE-Remastered-T task."""
 import ast,collections,csv,json,os,pathlib,time,types
 from concurrent.futures import ThreadPoolExecutor
@@ -77,7 +78,7 @@ def evaluate(c,args):
             write(lockfile,dict(identity=lock,locked_at=time.time(),scope='Full T; frozen 2Wiki seed17 transfer; no T-driven selection'))
     rows=json.loads((data/'public'/(split+'.json')).read_text())
     if args.phase=='smoke' or protocol=='fixed':rows=[r for r in rows if r['variant']==c['mquake']['fixed_variant']]
-    docs=json.loads((data/'memory'/(split+'.json')).read_text());encoder=E5(c['models']['retriever_path'],device='cuda:3')
+    docs=json.loads((data/'memory'/(split+'.json')).read_text());encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'))
     index=data/'memory'/(split+'_e5.npy');index_manifest=index.with_suffix('.json')
     fingerprint=digest(dict(memory=docs,encoder=c['models']['retriever_path'],format='title_newline_text_normalized_e5_v1'))
     if index.exists():assert json.loads(index_manifest.read_text())['input_hash']==fingerprint
@@ -218,7 +219,7 @@ def adapt_evaluate(c):
     if lockfile.exists():assert json.loads(lockfile.read_text())['identity']==identity,'Adapted QA identity changed'
     else:write(lockfile,dict(identity=identity,time=time.time(),scope='292 train-disjoint holdout cases, three variants; no gold path in QA retrieval; 15 methods = 13,140 predictions'))
     rows=[r for r in json.loads((data/'public/T.json').read_text()) if r['case_id'] in test];assert len(rows)==len(test)*3
-    docs=json.loads((data/'memory/T.json').read_text());vectors=np.load(data/'memory/T_e5.npy');encoder=E5(c['models']['retriever_path'],device='cuda:3');generator=Generator(c)
+    docs=json.loads((data/'memory/T.json').read_text());vectors=np.load(data/'memory/T_e5.npy');encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'));generator=Generator(c)
     identity_hash=digest(identity)
     def question(row):
         ex=InferenceExample(qid=row['qid'],question=row['question']);results=[]

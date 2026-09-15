@@ -3,20 +3,22 @@ import torch
 from .audit import digest,write
 from .source_reader import ReBindModule
 from .joint_decoder import decode,constraint_penalty
+from .runtime import resolve_device,encoder_dimension,peak_memory
 
 class FeatureBuilder:
     def __init__(self,encoder,config):
-        self.encoder=encoder; self.root=pathlib.Path(config['paths']['data_root'])/'features'; self.root.mkdir(exist_ok=True); self.config=config
+        self.encoder=encoder; self.root=pathlib.Path(config['paths']['data_root'])/'features'; self.root.mkdir(parents=True,exist_ok=True); self.config=config
     def build(self,question,graph,registry,docs,proposal,cache_context=None):
-        key=digest(dict(feature_version='centered_window_v2',cache_context=cache_context,question=question,graph=graph.__dict__,candidates=registry.snapshot(),docs=docs,proposal=proposal,config=self.config))
+        key=digest(dict(feature_version='dimension_empty_safe_v3',cache_context=cache_context,question=question,graph=graph.__dict__,candidates=registry.snapshot(),docs=docs,proposal=proposal,config=self.config))
         file=self.root/(key+'.pt')
         if file.exists(): return torch.load(file,weights_only=True)
-        domain=registry.snapshot(); vars=list(domain); n=len(vars); k=max(len(domain[v]) for v in vars); h=768
-        candidate=torch.zeros(n,k,h); valid=torch.zeros(n,k,dtype=torch.bool)
+        domain=registry.snapshot(); vars=list(domain); n=len(vars); k=max(len(domain[v]) for v in vars)
+        valid=torch.zeros(n,k,dtype=torch.bool)
         texts=[]; positions=[]
         for i,v in enumerate(vars):
             for j,c in enumerate(domain[v]): texts.append(c['surface']+' '+graph.variables[i]['description']); positions.append((i,j)); valid[i,j]=True
         vectors=self.encoder.encode(texts,'query')
+        h=vectors.shape[-1];candidate=torch.zeros(n,k,h)
         for vec,(i,j) in zip(vectors,positions): candidate[i,j]=torch.from_numpy(vec)
         roles=torch.from_numpy(self.encoder.encode([question+' '+v['description']+' '+json.dumps([slot for slot in graph.slots if v['var_id'] in slot['ordered_arguments']],sort_keys=True) for v in graph.variables],'query'))
         tokens=[]; masks=[]; windows=[]; source_indices=[]
@@ -33,7 +35,12 @@ class FeatureBuilder:
             for start,end in sorted(ranges):
                 window=dict(doc,text=doc['text'][start:end]); windows.append(window); source_indices.append(di)
                 t,m=self.encoder.encode([doc['title']+'\n'+window['text']],'passage',tokens=True); tokens.append(t[0].cpu()); masks.append(m[0].cpu())
+        if not tokens:
+            # One numerically safe, unlinked padding source; -1 is never a document identity.
+            tokens=[torch.zeros(1,h)];masks=[torch.ones(1,dtype=torch.bool)];source_indices=[-1]
         maxlen=max(len(x) for x in tokens); memory=torch.zeros(len(tokens),maxlen,h); tokenmask=torch.zeros(len(tokens),maxlen,dtype=torch.bool)
+        for s,(t,m) in enumerate(zip(tokens,masks)):
+            memory[s,:len(t)]=t;tokenmask[s,:len(m)]=m
         links=torch.zeros(len(tokens),n,k,dtype=torch.bool)
         for s,(t,m,doc) in enumerate(zip(tokens,masks,windows)):
             memory[s,:len(t)]=t; tokenmask[s,:len(m)]=m
@@ -50,15 +57,25 @@ class FeatureBuilder:
         torch.save(result,file); return result
 
 class NeuralState:
-    def __init__(self,encoder,config,checkpoint,mode='rebind',device='cuda:2',split='inference'):
+    def __init__(self,encoder,config,checkpoint,mode='rebind',device=None,split='inference'):
+        device=resolve_device(config,'scorer',device)
         self.features=FeatureBuilder(encoder,config); self.config=config; self.device=device; self.mode=mode; self.split=split
-        self.model=ReBindModule(d=config['rebind']['hidden_dim'],layers=config['rebind']['layers'],mode='rebind' if mode in ['frozen_old_read','no_revision_loss'] else mode).to(device)
-        ckpt=torch.load(checkpoint,weights_only=True,map_location=device); self.metadata={k:v for k,v in ckpt.items() if k not in ['model','optimizer']}; self.model.load_state_dict(ckpt['model']); self.model.eval(); self.previous={}; self.old_reads={}
+        ckpt=torch.load(checkpoint,weights_only=True,map_location=device)
+        dimension=ckpt['model']['project.weight'].shape[1]
+        if hasattr(encoder,'embedding_dim') and dimension!=encoder_dimension(encoder):raise ValueError('Checkpoint input dimension differs from encoder; use a matching checkpoint or retrain')
+        self.model=ReBindModule(input_dim=dimension,d=config['rebind']['hidden_dim'],layers=config['rebind']['layers'],mode='rebind' if mode in ['frozen_old_read','no_revision_loss'] else mode).to(device)
+        self.metadata={k:v for k,v in ckpt.items() if k not in ['model','optimizer']}; self.model.load_state_dict(ckpt['model']); self.model.eval(); self.previous={}; self.old_reads={}
     @torch.no_grad()
     def update(self,example,graph,registry,proposal,docs,round_index):
         f={k:v.to(self.device) for k,v in self.features.build(example.question,graph,registry,docs,proposal,dict(qid=example.qid,split=self.split)).items()}
         domain=registry.snapshot(); vars=list(domain); freeze=None
-        if self.mode=='frozen_old_read':
+        if self.config.get('final_plan'):
+            from .assignments import admissible
+            policy=self.config['final_plan'].get('relation_policy','literal')
+            for i,v in enumerate(vars):
+                for j,candidate in enumerate(domain[v]):
+                    f['valid'][i,j] &= admissible(candidate,policy)
+        if self.mode=='frozen_old_read' and docs:
             # Freeze ALL old sources by first-exposure candidate IDs, including their special logits.
             # A newly proposed candidate gets zero old-source value; no new window bypasses the lesion.
             rows=[]; n,k=f['valid'].shape; d=self.config['rebind']['hidden_dim']
@@ -74,7 +91,7 @@ class NeuralState:
                 else:
                     for si in (f['source_doc_index']==di).nonzero().flatten().tolist():
                         rows.append(dict(tokens=f['tokens'][si],mask=f['token_mask'][si],link=f['links'][si],score=f['candidate'].new_zeros(n,k),value=f['candidate'].new_zeros(n,k,d),special=f['candidate'].new_zeros(n,2),old=False,di=di))
-            width=max(len(row['tokens']) for row in rows); memory=f['tokens'].new_zeros(len(rows),width,768); mask=torch.zeros(len(rows),width,dtype=torch.bool,device=self.device)
+            width=max(len(row['tokens']) for row in rows); memory=f['tokens'].new_zeros(len(rows),width,f['tokens'].shape[-1]); mask=torch.zeros(len(rows),width,dtype=torch.bool,device=self.device)
             for si,row in enumerate(rows): memory[si,:len(row['tokens'])]=row['tokens']; mask[si,:len(row['mask'])]=row['mask']
             f.update(tokens=memory,token_mask=mask,links=torch.stack([r['link'] for r in rows]),source_doc_index=torch.tensor([r['di'] for r in rows],device=self.device))
             freeze=(torch.tensor([r['old'] for r in rows],device=self.device),torch.stack([r['score'] for r in rows]),torch.stack([r['value'] for r in rows]),torch.stack([r['special'] for r in rows]))
@@ -91,7 +108,7 @@ class NeuralState:
             if not torch.isfinite(out['unary'][f['valid']]).all() or not torch.isfinite(out['pair']).all():raise ValueError('Nonfinite operator output')
             counts=f['valid'].sum(-1).tolist();bridge_counts=f['valid'][:,1:].sum(-1).tolist();n=len(counts)
             legal=sum(counts[i]*counts[j]*bridge_counts[k] for i in range(n) for j in range(n) for k in range(n) if len({i,j,k})==3 and f['allowed'][i,j,k])
-            activity=dict(variables=n,valid_candidates=counts,interpretation_graph_nodes=0,legal_message_paths=legal,nonzero_messages_by_layer=measured,frontier_score_used_for_query=False,candidate_tensor_shape=list(f['candidate'].shape),source_windows=len(f['tokens']))
+            activity=dict(variables=n,valid_candidates=counts,interpretation_graph_nodes=0,legal_message_paths=legal,nonzero_messages_by_layer=measured,frontier_score_used_for_query=False,candidate_tensor_shape=list(f['candidate'].shape),source_windows=int((f['source_doc_index']>=0).sum()))
         else:out=self.model(**f,freeze=freeze)
         if self.mode=='frozen_old_read':
             for di,doc in enumerate(docs):
@@ -99,14 +116,15 @@ class NeuralState:
                 self.old_reads[doc['doc_id']]=[dict(tokens=f['tokens'][si].clone(),mask=f['token_mask'][si].clone(),link=f['links'][si].clone(),score=out['source'][si].clone(),value=out['source_values'][si].clone(),special=out['source_special'][si].clone(),ids={v:[c['candidate_id'] for c in domain[v]] for v in vars}) for si in (f['source_doc_index']==di).nonzero().flatten().tolist()]
         beams=decode(out['unary'],out['pair'],f['valid'],beam=self.config['rebind']['joint_beam'],constraint=lambda a:constraint_penalty(graph,domain,a))
         assignments=[{v:domain[v][a[i]]['surface'] for i,v in enumerate(vars)} for _,a in beams]
+        candidate_assignments=[{v:domain[v][a[i]]['candidate_id'] for i,v in enumerate(vars)} for _,a in beams]
         query_beams=sorted(beams,key=lambda item:-(item[0]+.2*sum(float(out['frontier'][i,ci]) for i,ci in enumerate(item[1]))))
         query_assignments=[{v:domain[v][a[i]]['surface'] for i,v in enumerate(vars)} for _,a in query_beams]
         current={v:domain[v][beams[0][1][i]]['candidate_id'] for i,v in enumerate(vars)} if beams else {}
         revisions=[dict(variable=v,before=self.previous[v],after=c,verified=False) for v,c in current.items() if v in self.previous and self.previous[v]!=c]
         self.previous=current
         source_indices=f.get('source_doc_index',torch.arange(len(docs),device=self.device))
-        source_scores={docs[int(source_indices[s])]['doc_id']+f':window{s}':[out['source'][s,i,:len(domain[v])].cpu().tolist() for i,v in enumerate(vars)] for s in range(len(out['source']))}
-        result=dict(assignments=assignments,query_assignments=query_assignments,source_scores=source_scores,revisions=revisions,observed_slots=[],answer_ready=False,status='inferred_or_unresolved',candidate_ids=current)
+        source_scores={docs[int(source_indices[s])]['doc_id']+f':window{s}':[out['source'][s,i,:len(domain[v])].cpu().tolist() for i,v in enumerate(vars)] for s in range(len(out['source'])) if int(source_indices[s])>=0}
+        result=dict(assignments=assignments,candidate_assignments=candidate_assignments,query_assignments=query_assignments,source_scores=source_scores,revisions=revisions,observed_slots=[],answer_ready=False,status='inferred_or_unresolved',candidate_ids=current)
         if activity is not None:
             no_pair=decode(out['unary'],torch.zeros_like(out['pair']),f['valid'],beam=self.config['rebind']['joint_beam'],constraint=lambda a:constraint_penalty(graph,domain,a))
             activity['pair_potential_changes_top_decode']=bool(beams and no_pair and beams[0][1]!=no_pair[0][1]);result['operator_activity']=activity
@@ -121,7 +139,7 @@ def prepare_natural(config,limit=None):
     from .audit import append
     import collections,re,time
     root=pathlib.Path(config['paths']['workdir']); data=pathlib.Path(config['paths']['data_root']); directory=data/'natural_transitions'; directory.mkdir(exist_ok=True)
-    generator=Generator(config); encoder=E5(config['models']['retriever_path'],device='cuda:3'); builder=FeatureBuilder(encoder,config); audit=collections.Counter(); records=[]
+    generator=Generator(config); encoder=E5(config['models']['retriever_path'],device=resolve_device(config,'retriever')); builder=FeatureBuilder(encoder,config); audit=collections.Counter(); records=[]
     def terms(s): return {w[:5] for w in re.findall(r'[a-z]+',s.lower()) if len(w)>3}
     for split in ['train','dev']:
         rows=list(read_rows(data/'private/2wiki'/f'{split}.jsonl'))
@@ -188,11 +206,11 @@ def train_natural(config,seeds=None):
     manifest=json.loads(manifestfile.read_text()); valid=[r for r in manifest['records'] if r['valid_unary']+r['valid_pair']>0]; rows={s:[r for r in valid if r['split']==s] for s in ['train','dev']}
     if not rows['train'] or not rows['dev']: raise Blocked('No informative train/dev natural supervision')
     loaded={row['path']:torch.load(row['path'],weights_only=True,mmap=True) for row in valid}
-    device=os.environ.get('REBIND_TRAIN_DEVICE','cuda:2'); results=[]
+    device=resolve_device(config,'train'); results=[]
     for method in ['bp_rebind','rebind','independent_binding','no_revision_loss']:
         for seed in seeds or config['train']['seeds']:
             rows['train']=sorted(rows['train'],key=lambda r:(r['qid'],r['path']))
-            torch.manual_seed(seed); model=ReBindModule(d=config['rebind']['hidden_dim'],layers=config['rebind']['layers'],mode='rebind' if method=='no_revision_loss' else method).to(device)
+            torch.manual_seed(seed); model=ReBindModule(input_dim=next(iter(loaded.values()))['features']['candidate'].shape[-1],d=config['rebind']['hidden_dim'],layers=config['rebind']['layers'],mode='rebind' if method=='no_revision_loss' else method).to(device)
             opt=torch.optim.AdamW(model.parameters(),lr=config['train']['learning_rate'],weight_decay=config['train']['weight_decay']); best=float('inf'); directory=data/'checkpoints'/method/str(seed); directory.mkdir(parents=True,exist_ok=True)
             for epoch in range(config['train']['epochs_initial']):
                 rng=random.Random(seed+epoch); rng.shuffle(rows['train']); stats={}

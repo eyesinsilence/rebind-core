@@ -69,9 +69,9 @@ python scripts/run_final_plan.py --help
 
 这是研究实现，代码可运行不等于已经证明方法优于基线；本仓库不附带性能或机制验证结论。
 
-## 第一阶段：公共前端执行修复
+## 第一阶段：公共前端执行修复（v2）
 
-`final_frontend.py` 的执行版本为 `action_bound_literal_provenance_v2`。JSON、BP 和 ReBind 共享这套前端：
+第一阶段引入了 `action_bound_literal_provenance_v2`；下述动作一致性机制由当前 v3 版本保留。JSON、BP 和 ReBind 共享这套前端：
 
 - 每次检索动作携带 `slot_id`、`input_values` 和调度时的 `evidence_version`。检索后优先按该动作的真实输入抽取，再处理保留绑定中的其他不同输入组合。
 - 抽取任务采用当前可见证据版本。相同任务和相同证据只尝试一次；新证据可触发新的抽取。每个关系与输入组合最多发起一次定向检索，总检索预算仍由原配置限制。
@@ -87,3 +87,28 @@ python scripts/audit_frontend_execution.py /path/to/full_trace.json
 ```
 
 轨迹审计只检查执行一致性；无法从未带标签的轨迹推断正确候选覆盖率、真实纠正事件或 QA 增益。后续解码复核、来源聚合、门控和重新训练属于独立阶段。
+
+## 调试报告修复（v3）
+
+当前前端版本：`candidate_identity_relation_constraints_v3`。
+
+- **统一状态验证**：`assignments.py` 为 JSON 和神经路径提供相同的来源输入检查与 graph constraint 检查。内部用 `candidate_assignments` 保存候选 ID；`assignments` 仅保留显示文本。不能唯一对应候选的旧式名称输出保持 UNKNOWN。同名的父候选通过 `input_candidate_ids` 区分，候选 ID 也不会自动被视为已证实的现实实体 ID。
+- **关系准入**：`configs/final.yaml` 默认 `relation_policy: strict`。共享模型核验引用中的输入、输出、关系、方向和作用域；只有得到正向关系支持的检索候选才能进入严格模式的绑定。背景假设与仅共同出现的候选不进入严格绑定。核验模型可能出错，因此 `verified` 仍不自动升级为真。
+- **兼容诊断模式**：显式使用 `relation_policy: literal` 可复现仅按字面来源准入的策略；旧调用若省略该设置仍采用 literal。严格模式改变了可用候选与检索行为，两种策略的分数必须分别报告。
+- **编码与空证据**：E5 token 编码保留全部 batch 并统一 padding；空输入返回具有正确维度的空结果。空检索使用未关联任何文档的数值 padding，输出里不伪造来源。单候选的批处理三角更新也与单样本实现一致。
+- **环境适配**：通过 `devices.retriever/generator/scorer/train` 或对应 `REBIND_*_DEVICE` 选择设备；auto 在可用时选择 CUDA 0，否则选择 CPU。输入维度由编码器、特征或检查点确定；编码器与旧检查点不匹配时明确报错，不静默加载。
+- **生成身份与结束原因**：支持单文件及分片 safetensors/PyTorch 权重，并散列实际权重文件。优先保留服务返回的 finish_reason，仅在缺失时使用 token 数回退判断；升级生成缓存版本，避免沿用旧结束原因记录。
+
+### 固定检查点的开发集重跑
+
+该入口不训练、不重新选择检查点，仅在已使用过的开发数据上验证修复：
+
+```bash
+python scripts/run_debug_validation.py --config /path/to/runtime.yaml --stage smoke --partition build --seeds 17
+python scripts/run_debug_validation.py --config /path/to/runtime.yaml --stage dev --partition build --seeds 17 29 43
+python scripts/run_debug_validation.py --config /path/to/runtime.yaml --stage dev --partition check --seeds 17 29 43
+```
+
+调用方需准备 `manifests/split_manifest.json`、`manifests/frozen_checkpoints.json`（含 selected_checkpoints）、公开题目、编辑记忆和索引、离线评分标签及官方评分代码。问题和检查点选择在推理前锁定，标签仅在全部推理完成后用于评分。阶段文件身份不一致时必须使用新运行目录。
+
+调试报告声称的跨行 SyntaxError 在审阅对应的 `1d71a01` 提交及本次检查中均未复现；实际通过语法编译及测试收集验证，未凭报告示意改写有效提示文本。

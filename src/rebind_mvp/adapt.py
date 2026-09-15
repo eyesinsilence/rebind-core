@@ -1,3 +1,4 @@
+from .runtime import resolve_device,encoder_dimension,peak_memory
 """MQuAKE edit-group adaptation. Gold paths are controlled TRAINING evidence, never QA retrieval."""
 import argparse, collections, json, math, os, pathlib, random, time
 import numpy as np
@@ -44,7 +45,7 @@ class BatchedReBind(ReBindModule):
                 left=self.triangle.left(z); right=self.triangle.right(z)
                 maximum=z.new_full(z.shape[:-1],-torch.inf); denom=torch.zeros_like(maximum); numer=torch.zeros_like(z)
                 ii=torch.arange(n,device=x.device)[:,None]; jj=torch.arange(n,device=x.device)[None,:]
-                for bridge in range(n):
+                for bridge in range(n if k>1 else 0):
                     shape=(b,n,n,k,k,k-1,d)
                     l=left[:,:,bridge,:,1:][:,:,None,:,None,:,:].expand(shape)
                     rbridge=right[:,bridge,:,1:,:].permute(0,1,3,2,4)[:,None,:,None,:,:,:].expand(shape)
@@ -141,7 +142,7 @@ def encode(c,shard):
     root=pathlib.Path(c['paths']['workdir']); data=root/'data/adapt'; path=data/f'embeddings_{shard}.pt'
     identity=digest(dict(texts=digest(data/'texts.json'),model=c['models']['retriever_path'],format='e5_float32_pooled_fp16_tokens_v1'))
     if path.exists():assert torch.load(path,weights_only=True)['identity']==identity;return
-    encoder=E5(c['models']['retriever_path'],device='cuda:0',batch=64); rows=[r for r in json.loads((data/'texts.json').read_text()) if int(r['key'][:8],16)%4==shard]; values={};start=time.time()
+    encoder=E5(c['models']['retriever_path'],device=resolve_device(c,'retriever'),batch=64); rows=[r for r in json.loads((data/'texts.json').read_text()) if int(r['key'][:8],16)%4==shard]; values={};start=time.time()
     for kind in ['query','passage']:
         rr=[r for r in rows if r['kind']==kind]
         for begin in range(0,len(rr),64):
@@ -165,7 +166,7 @@ def batch_features(samples,embeddings,device):
     features=[]
     for stage in ['before','after']:
         docs=[s[stage+'_docs'] for s in samples]; count=len(docs[0]); vectors=[[lookup('passage','MQuAKE fact\n'+t) for t in ds] for ds in docs];width=max(len(v) for vs in vectors for v in vs)
-        tokens=torch.zeros(b,count,width,768);mask=torch.zeros(b,count,width,dtype=torch.bool);links=torch.zeros(b,count,n,k,dtype=torch.bool)
+        tokens=torch.zeros(b,count,width,candidate.shape[-1]);mask=torch.zeros(b,count,width,dtype=torch.bool);links=torch.zeros(b,count,n,k,dtype=torch.bool)
         for bi,(ss,vs,ds) in enumerate(zip(samples,vectors,docs)):
             for si,(v,text) in enumerate(zip(vs,ds)):
                 tokens[bi,si,:len(v)]=v;mask[bi,si,:len(v)]=True
@@ -202,7 +203,7 @@ def loss_and_metrics(before,after,labels,revision_weight):
 
 
 def train(c,method):
-    root=pathlib.Path(c['paths']['workdir']);data=root/'data/adapt'; settings=c['adapt']; device='cuda:0';torch.set_num_threads(8)
+    root=pathlib.Path(c['paths']['workdir']);data=root/'data/adapt'; settings=c['adapt']; device=resolve_device(c,'train');torch.set_num_threads(8)
     samples=json.loads((data/'samples.json').read_text());embeddings={}
     for shard in range(4):embeddings.update(torch.load(data/f'embeddings_{shard}.pt',weights_only=True)['values'])
     identity=digest(dict(config=c,split=digest(data/'split.json'),samples=digest(data/'samples.json'),code=digest(pathlib.Path(__file__))))
@@ -215,7 +216,7 @@ def train(c,method):
         packed[key]=([{k:v.to(device=device,dtype=torch.float16 if k=='tokens' else v.dtype) for k,v in f.items()} for f in features],{k:v.to(device) for k,v in labels.items()})
         positions.update({row['qid']:i for i,row in enumerate(rows)})
     del features,labels,embeddings
-    print('resident_features_gib',torch.cuda.memory_allocated()/2**30,flush=True)
+    print('resident_features_gib',(torch.cuda.memory_allocated(device) if device.startswith('cuda') else 0)/2**30,flush=True)
     def run_epoch(model,rows,opt=None,seed=0):
         model.train(opt is not None); groups=collections.defaultdict(list);rng=random.Random(seed)
         if opt:
@@ -249,7 +250,7 @@ def train(c,method):
         if settings.get('continue_pairs') and [method,seed] not in settings['continue_pairs']:continue
         torch.manual_seed(seed);np.random.seed(seed);random.seed(seed)
         mode='rebind' if method=='no_revision_loss' else method
-        model=BatchedReBind(d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode).to(device)
+        model=BatchedReBind(input_dim=next(iter(packed.values()))[0][0]['candidate'].shape[-1],d=c['rebind']['hidden_dim'],layers=c['rebind']['layers'],mode=mode).to(device)
         initial=pathlib.Path(c['mquake']['checkpoint_root'])/method/str(seed)/'best.pt';model.load_state_dict(torch.load(initial,map_location=device,weights_only=True)['model'])
         directory=data/settings.get('checkpoint_directory','checkpoints')/method/str(seed);directory.mkdir(parents=True,exist_ok=True)
         if settings.get('resume_parent') and not (directory/'last.pt').exists():

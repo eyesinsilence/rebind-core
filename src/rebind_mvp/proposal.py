@@ -5,6 +5,7 @@ import torch
 from transformers import AutoTokenizer,AutoModelForCausalLM
 from .audit import digest,write,append
 from .schema import QuestionGraph,CandidateRegistry,EvidenceStore,Document
+from .runtime import resolve_device,model_revision,generation_finish,peak_memory
 
 class Generator:
     @property
@@ -23,14 +24,15 @@ class Generator:
         return self.local.context
     @context.setter
     def context(self,value): self.local.context=value
-    def __init__(self,config,device='cuda:1'):
+    def __init__(self,config,device=None):
         self.local=threading.local(); self.config=config; self.root=pathlib.Path(config['paths']['workdir']); self.cache=pathlib.Path(config['paths']['data_root'])/'generation_cache'; self.cache.mkdir(parents=True,exist_ok=True)
         path=config['models']['generator_path']; self.tokenizer_base=AutoTokenizer.from_pretrained(path,local_files_only=True,padding_side='left')
         self.server=config['models'].get('server_url')
+        device='cpu' if self.server else resolve_device(config,'generator',device)
         self.model=None
         if not self.server:
             self.model=AutoModelForCausalLM.from_pretrained(path,local_files_only=True,torch_dtype=torch.bfloat16,attn_implementation='sdpa').to(device).eval(); self.model.requires_grad_(False)
-        self.device=device; self.calls=[]; self.context={}; self.revision=digest([digest(pathlib.Path(path)/n) for n in ['config.json','tokenizer.json','model.safetensors.index.json']])
+        self.device=device; self.calls=[]; self.context={}; self.revision=model_revision(path)
     def pack(self,docs,budget=None):
         budget=budget or self.config['models']['raw_evidence_tokens']; packed=[]; used=0
         for d in docs:
@@ -61,14 +63,15 @@ class Generator:
             inputs=self.tokenizer(rendered,return_tensors='pt'); count=inputs.input_ids.shape[-1]
             if not self.server: inputs=inputs.to(self.device)
             if count>self.config['models']['prompt_max_tokens']: raise ValueError(f'Prompt overflow {count}; no silent truncation')
-            limit=max_tokens or self.config['models']['generation_max_tokens']; key=digest(dict(context=self.context,model_revision=self.revision,config=self.config,prompt=rendered,stop=stop,max_tokens=limit,json_mode=json_mode))
+            limit=max_tokens or self.config['models']['generation_max_tokens']; key=digest(dict(generation_version=2,context=self.context,model_revision=self.revision,config=self.config,prompt=rendered,stop=stop,max_tokens=limit,json_mode=json_mode))
             file=self.cache/(key+'.json'); started=time.time(); hit=file.exists()
             if hit: result=json.loads(file.read_text())
             else:
+                provider_reason=None
                 kwargs=dict(max_new_tokens=limit,do_sample=False,pad_token_id=self.tokenizer.eos_token_id)
                 if stop: kwargs.update(stop_strings=stop,tokenizer=self.tokenizer)
                 if self.server:
-                    payload=dict(model='Qwen2.5-7B-Instruct',messages=messages,temperature=0,max_tokens=limit,seed=17)
+                    payload=dict(model=self.config['models'].get('served_model_name','Qwen2.5-7B-Instruct'),messages=messages,temperature=self.config['models'].get('temperature',0),max_tokens=limit,seed=17)
                     if stop: payload['stop']=stop
                     if json_mode: payload['response_format']={'type':'json_schema','json_schema':{'name':'binding_state','strict':False,'schema':json_mode}} if isinstance(json_mode,dict) else {'type':'json_object'}
                     replicas=os.environ.get('REBIND_SERVER_URLS',self.server).split(','); backend=replicas[int(digest(self.context.get('qid','0'))[:8],16)%len(replicas)]
@@ -81,13 +84,17 @@ class Generator:
                         self.calls.append(failed);append(self.root/'runs/initial_20260914/model_calls.jsonl',failed)
                         if error.code==500 and json_mode: raise ValueError('Backend rejected JSON generation: '+detail) from error
                         raise
-                    raw=api['choices'][0]['message']['content']; ids=range(api['usage']['completion_tokens'])
+                    choice=api['choices'][0];raw=choice['message']['content'];provider_reason=choice.get('finish_reason')
+                    if not isinstance(raw,str):raise ValueError('Provider returned no text content: '+str(provider_reason))
+                    ids=range(api['usage']['completion_tokens'])
                 else:
                     generated=self.model.generate(**inputs,**kwargs); ids=generated[0,count:]; raw=self.tokenizer.decode(ids,skip_special_tokens=True)
                 if stop:
                     positions=[raw.find(s) for s in stop if s in raw]
                     if positions: raw=raw[:min(positions)]
-                result=dict(text=raw,prompt=rendered,input_tokens=count,output_tokens=len(ids),truncated=len(ids)>=limit,finish='length' if len(ids)>=limit else 'stop',peak_memory_bytes=torch.cuda.max_memory_allocated(self.device) if not self.server else None,key=key,backend=backend if self.server else 'transformers')
+                result=dict(text=raw,prompt=rendered,input_tokens=count,output_tokens=len(ids),
+                    **generation_finish(provider_reason,len(ids),limit),peak_memory_bytes=peak_memory(self.device) if not self.server else None,
+                    key=key,backend=backend if self.server else 'transformers')
                 write(file,result)
             call=dict(result,cache_hit=hit,seconds=time.time()-started,context=self.context.copy()); self.calls.append(call)
             append(self.root/'runs/initial_20260914/model_calls.jsonl',call); outputs.append(result['text'])
@@ -95,6 +102,7 @@ class Generator:
     def json(self,prompt,max_tokens=None,schema=None):
         text=self.generate([prompt],max_tokens=max_tokens,json_mode=schema or True)[0]
         if self.calls[-1]['truncated']: raise ValueError('Truncated JSON generation')
+        if self.calls[-1].get('finish') not in ['stop','length',None]:raise ValueError('Provider did not finish a JSON answer: '+str(self.calls[-1]['finish']))
         raw=text.strip()
         if raw.startswith('```'): raw=raw.split('\n',1)[1].rsplit('```',1)[0].strip()
         return json.loads(raw)
