@@ -83,32 +83,95 @@ def supported_assignments(graph,registry,state):
     return out
 
 
-def next_action(graph,assignments,executed):
+FRONTEND_VERSION = 'action_bound_literal_provenance_v2'
+
+
+def relation_task(slot, inputs, evidence_version=None):
+    """Separate a bounded retrieval identity from evidence-specific extraction."""
+    inputs = copy.deepcopy(inputs)
+    query_key = digest(dict(slot=slot['slot_id'], inputs=inputs, scope=slot.get('scope')))
+    key = digest(dict(query_key=query_key, evidence_version=evidence_version))
+    return dict(slot_id=slot['slot_id'], inputs=inputs, input_values=copy.deepcopy(inputs),
+                scope=copy.deepcopy(slot.get('scope')), evidence_version=evidence_version,
+                query_key=query_key, key=key)
+
+
+def visible_evidence_version(visible):
+    # Packing/truncation changes are evidence changes; retrieval ordering alone is not.
+    identities = [dict(doc_id=d['doc_id'], title=d.get('title', ''), text=d['text'],
+                       offsets=d.get('offsets', [0, len(d['text'])])) for d in visible]
+    return digest(sorted(identities, key=digest))
+
+
+def extraction_tasks(graph, assignments, action, evidence_version):
+    """The queried branch comes first, even if it is absent from current top-1."""
+    tasks = []
+    seen = set()
+    slots = {s['slot_id']: s for s in graph.slots}
+
+    def add(slot, inputs, for_action=False):
+        if any(value == 'UNKNOWN' for value in inputs.values()):
+            return
+        task = relation_task(slot, inputs, evidence_version)
+        if task['key'] not in seen:
+            seen.add(task['key'])
+            tasks.append(dict(task, for_action=for_action))
+
+    if action is not None:
+        add(slots[action['slot_id']], action['input_values'], True)
+    for slot in graph.slots:
+        for binding in assignments:
+            add(slot, {v: binding.get(v, 'UNKNOWN') for v in slot['ordered_arguments'][:-1]})
+    return tasks
+
+
+def next_action(graph,assignments,executed,evidence_version=None):
     for slot in graph.slots:
         for binding in assignments:
             inputs={v:binding.get(v,'UNKNOWN') for v in slot['ordered_arguments'][:-1]}
             if any(x=='UNKNOWN' for x in inputs.values()):continue
-            key=digest(dict(slot=slot['slot_id'],inputs=inputs,scope=slot.get('scope')))
-            if key in executed:continue
+            task=relation_task(slot,inputs,evidence_version)
+            if task['query_key'] in executed or task['key'] in executed:continue
             template=slot.get('query_template','');fields=re.findall(r'\{([^{}]+)\}',template)
             query=template.format(**inputs) if fields and set(fields)==set(inputs) else slot['relation_text']+' '+' '.join(inputs.values())
-            return dict(slot_id=slot['slot_id'],inputs=inputs,query=query,key=key)
+            return dict(task,query=query)
     return None
 
 
-def add_candidate(registry,var,surface,kind,slot,inputs,round_index,doc=None,quote=None):
-    origins=[];sourceids=[]
+def add_candidate(registry,var,surface,kind,slot,inputs,round_index,doc=None,quote=None,relation=None):
+    origins=[];sourceids=[];provenance=[]
+    if not isinstance(surface,str) or not surface.strip() or surface=='UNKNOWN':
+        raise ValueError('Candidate must be a nonempty, named value')
     if kind=='retrieved':
-        if not doc or not quote or quote not in doc['text'] or surface not in doc['text'] or any(x.casefold() not in (doc['title']+' '+doc['text']).casefold() for x in inputs.values()):raise ValueError('Unverified relation candidate or input arguments')
-        origins=[digest([doc['doc_id'],doc['text'].index(quote),quote])];sourceids=[doc['doc_id']]
+        if not doc or not isinstance(quote,str) or not quote or quote not in doc['text'] or surface not in quote:
+            raise ValueError('Candidate output must occur inside the cited literal quote')
+        context=doc.get('title','')+' '+quote
+        if any(not isinstance(x,str) or x=='UNKNOWN' or x.casefold() not in context.casefold() for x in inputs.values()):
+            raise ValueError('Input arguments must occur in the cited quote or its title')
+        start=doc.get('offsets',[0])[0]+doc['text'].index(quote)
+        span_id=digest([doc['doc_id'],start,quote])
+        origins=[span_id];sourceids=[doc['doc_id']]
+        provenance=[dict(span_id=span_id,doc_id=doc['doc_id'],char_start=start,char_end=start+len(quote),
+                         quote=quote,title_context=doc.get('title',''),verification_level='literal_provenance')]
     elif kind not in ['question_anchor','parametric_hypothesis']:raise ValueError('Unknown provenance kind')
     identity=[kind,slot,inputs,surface,sourceids];cid=registry.add(var,surface,identity,origins,round_index)
-    registry.pool[var][cid].update(origin_kind=kind,source_doc_ids=sourceids,slot_id=slot,input_values=copy.deepcopy(inputs),verified=kind in ['retrieved','question_anchor'])
+    candidate=registry.pool[var][cid]
+    records={p['span_id']:p for p in candidate.get('provenance_records',[])}
+    records.update({p['span_id']:p for p in provenance})
+    candidate.update(origin_kind=kind,source_doc_ids=sourceids,slot_id=slot,input_values=copy.deepcopy(inputs),
+                     literal_provenance=kind=='retrieved',relation_checked=False,
+                     verification_level={'retrieved':'literal_provenance','question_anchor':'question_anchor',
+                                         'parametric_hypothesis':'unverified_hypothesis'}[kind],
+                     verified=kind=='question_anchor',provenance_records=list(records.values()),
+                     relation_claim=dict(slot_id=slot,input_values=copy.deepcopy(inputs),output_value=surface,
+                                         relation=copy.deepcopy(relation),status='not_checked'))
     return cid
 
 
 def run_repaired(example,retriever,generator,config,method,neural=None,knowledge='hybrid'):
     started=time.time();start_calls=len(generator.calls);context=generator.context.copy();components=dict(config.get('component_versions',{}));trace=[];errors=[];docs={};executed=set();hypotheses=set();raw='';graph=None;state={};queries=[]
+    components['frontend_execution']=FRONTEND_VERSION
+    extraction_attempts={}
     def stage(name):generator.context={**context,'stage':name,'components':components,'updater':method if name in ['state','reader'] else 'shared','checkpoint':getattr(neural,'checkpoint_hash',None) if name in ['state','reader'] else None}
     stage('parser')
     try:graph,compile_audit=compile_graph(generator,example,config)
@@ -120,25 +183,53 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
     state={'assignments':[{v['var_id']:v.get('anchor','UNKNOWN') for v in graph.variables}]};query=example.question;action=None
     for round_index in range(config['retrieval']['max_query_calls_including_initial']):
         retrieved=retriever.search(query);queries.append(query)
-        for d in retrieved:docs.setdefault(d['doc_id'],d)
+        for d in retrieved:docs[d['doc_id']]=d
         ordered=list({d['doc_id']:d for d in retrieved+list(docs.values())}.values());raw,visible=generator.pack(ordered);record=dict(round=round_index,query=query,retrieved_documents=retrieved,retrieved_ids=[d['doc_id'] for d in retrieved],visible_spans=[dict(doc_id=d['doc_id'],offsets=d['offsets']) for d in visible],action=action,graph=copy.deepcopy(asdict(graph)),candidate_events=[],policy_errors=[])
-        if action:executed.add(action['key'])
+        evidence_version=visible_evidence_version(visible)
+        record.update(evidence_version=evidence_version,frontend_version=FRONTEND_VERSION,extraction_tasks=[],
+                      retrieval_attempt=dict(status='completed',query=query,
+                                             action_key=action['key'] if action else None,
+                                             query_key=action['query_key'] if action else None))
+        if action:executed.add(action['query_key'])
         bindings=supported_assignments(graph,registry,state);accepted=[];rejected=[]
-        for slot in graph.slots:
-            inputs={v:bindings[0].get(v,'UNKNOWN') for v in slot['ordered_arguments'][:-1]};var=slot['ordered_arguments'][-1]
-            if any(x=='UNKNOWN' for x in inputs.values()):continue
-            task=dict(relation=slot['relation_text'],known_inputs=inputs,requested_role=next(v['description'] for v in graph.variables if v['var_id']==var));found=[]
+        for execution in extraction_tasks(graph,bindings,action,evidence_version):
+            slot=next(s for s in graph.slots if s['slot_id']==execution['slot_id'])
+            inputs=execution['input_values'];var=slot['ordered_arguments'][-1]
+            if execution['key'] in extraction_attempts:
+                previous=extraction_attempts[execution['key']]
+                record['extraction_tasks'].append(dict(execution,attempted=False,status='reused_attempt',
+                    completed=previous['completed'],produced_candidates=False,
+                    previous_status=previous['status'],previous_candidate_ids=previous['candidate_ids']))
+                # Keep the same quote-centered feature inputs when the visible evidence is unchanged.
+                accepted.extend(copy.deepcopy(previous['accepted']))
+                continue
+            task=dict(relation=slot['relation_text'],known_inputs=inputs,scope=slot.get('scope'),requested_role=next(v['description'] for v in graph.variables if v['var_id']==var));found=[]
+            task_record=dict(execution,attempted=True,completed=False,status='failed',produced_candidates=False)
+            accepted_start=len(accepted);rejected_start=len(rejected)
             stage('proposal')
             try:
                 prompt='Extract up to two answers to ONLY this relation from the raw updates. A document must state the requested relationship for the supplied input entity, not merely mention a same-type entity. If none, return an empty candidates array. Return JSON {"candidates":[{"surface":"literal output value","doc_id":"ID","quote":"exact source substring"}]}.\nRelation task: '+json.dumps(task)+'\nDocuments:\n'+raw
                 reply=generator.json(prompt,max_tokens=384)
-                for item in reply.get('candidates',[])[:2]:
-                    doc=next((d for d in visible if d['doc_id']==item.get('doc_id')),None)
+                if not isinstance(reply,dict) or not isinstance(reply.get('candidates'),list):
+                    raise ValueError('Extraction response requires a candidates array')
+                for item in reply['candidates'][:2]:
                     try:
-                        cid=add_candidate(registry,var,item['surface'],'retrieved',slot['slot_id'],inputs,round_index,doc,item.get('quote'));found.append(cid)
-                        quote=item['quote'];start=doc['text'].index(quote);accepted.append(dict(var_id=var,surface=item['surface'],doc_id=doc['doc_id'],quote=quote,span_id=registry.pool[var][cid]['origin_span_ids'][0],candidate_id=cid,char_start=doc['offsets'][0]+start,char_end=doc['offsets'][0]+start+len(quote)))
-                    except (ValueError,KeyError,TypeError) as error:rejected.append(dict(item=item,error=repr(error)))
-            except (ValueError,KeyError,TypeError) as error:record['policy_errors'].append(dict(stage='proposal',slot=slot['slot_id'],error=repr(error)))
+                        if not isinstance(item,dict):raise ValueError('Candidate must be an object')
+                        doc=next((d for d in visible if d['doc_id']==item.get('doc_id') and isinstance(item.get('quote'),str) and item['quote'] in d['text']),None)
+                        cid=add_candidate(registry,var,item['surface'],'retrieved',slot['slot_id'],inputs,round_index,doc,item.get('quote'),relation=slot);found.append(cid)
+                        candidate=registry.pool[var][cid];quote=item['quote'];start=doc['offsets'][0]+doc['text'].index(quote)
+                        accepted.append(dict(var_id=var,surface=item['surface'],doc_id=doc['doc_id'],quote=quote,
+                            span_id=digest([doc['doc_id'],start,quote]),candidate_id=cid,char_start=start,char_end=start+len(quote),
+                            slot_id=slot['slot_id'],input_values=copy.deepcopy(inputs),task_key=execution['key'],
+                            evidence_version=evidence_version,verification_level=candidate['verification_level'],relation_checked=False))
+                    except (ValueError,KeyError,TypeError) as error:rejected.append(dict(item=item,task_key=execution['key'],error=repr(error)))
+                task_record.update(completed=True,status='completed')
+            except (ValueError,KeyError,TypeError) as error:
+                task_record['error']=repr(error)
+                record['policy_errors'].append(dict(stage='proposal',slot=slot['slot_id'],input_values=copy.deepcopy(inputs),task_key=execution['key'],error=repr(error)))
+            task_record.update(produced_candidates=bool(found),candidate_ids=found[:],rejected_candidates=len(rejected)-rejected_start)
+            record['extraction_tasks'].append(task_record)
+            extraction_attempts[execution['key']]=dict(task_record,accepted=copy.deepcopy(accepted[accepted_start:]))
             hkey=digest([slot['slot_id'],inputs]);is_answer=next(v.get('is_answer',False) for v in graph.variables if v['var_id']==var)
             if knowledge=='hybrid' and not found and not is_answer and hkey not in hypotheses:
                 hypotheses.add(hkey);stage('hypothesis')
@@ -153,8 +244,8 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
         before=copy.deepcopy(state);stage('state')
         try:
             if method=='json_fix':
-                domain=registry.snapshot();compact={v:[{k:x.get(k) for k in ['surface','origin_kind','slot_id','input_values','source_doc_ids']} for x in xs] for v,xs in domain.items()}
-                prompt=JSON_STATE_PROMPT+'Keep anchors fixed. A parametric_hypothesis is tentative knowledge, never source evidence. A downstream candidate is usable only when its input_values match the current upstream bindings. Prefer a directly stated update over conflicting remembered hypotheses.\nQuestion: '+example.question+'\nGraph: '+json.dumps(asdict(graph))+'\nCandidates: '+json.dumps(compact)+'\nPrevious state: '+json.dumps(state)+'\nDocuments:\n'+raw
+                domain=registry.snapshot();compact={v:[{k:x.get(k) for k in ['surface','origin_kind','slot_id','input_values','source_doc_ids','verification_level','relation_checked']} for x in xs] for v,xs in domain.items()}
+                prompt=JSON_STATE_PROMPT+'Keep anchors fixed. A parametric_hypothesis is tentative knowledge, never source evidence. literal_provenance only checks quoted text; it does not verify a relationship, its direction or scope. A downstream candidate is usable only when its input_values match the current upstream bindings. Prefer a directly stated update over conflicting remembered hypotheses.\nQuestion: '+example.question+'\nGraph: '+json.dumps(asdict(graph))+'\nCandidates: '+json.dumps(compact)+'\nPrevious state: '+json.dumps(state)+'\nDocuments:\n'+raw
                 schema={'type':'object','properties':{'assignments':{'type':'array','minItems':1,'maxItems':2,'items':{'type':'object','properties':{v:{'type':'string','enum':[x['surface'] for x in xs]} for v,xs in domain.items()},'required':list(domain),'additionalProperties':False}}},'required':['assignments']}
                 prompt=prompt.replace(JSON_STATE_PROMPT,'Select at most two consistent joint bindings. Output ONLY {"assignments":[{"variable_id":"candidate surface"}]}; no explanations or other fields. ')
                 proposed=generator.json(prompt,max_tokens=512,schema=schema);state=dict(assignments=supported_assignments(graph,registry,proposed),status='inferred_or_unresolved')
@@ -162,7 +253,7 @@ def run_repaired(example,retriever,generator,config,method,neural=None,knowledge
         except (ValueError,KeyError,TypeError) as error:record['policy_errors'].append(dict(stage='state',error=repr(error)));state=before
         binding=supported_assignments(graph,registry,state);state['assignments']=binding
         if not binding:state['assignments']=supported_assignments(graph,registry,{})
-        action=next_action(graph,state['assignments'],executed)
+        action=next_action(graph,state['assignments'],executed,evidence_version)
         record.update(candidates=registry.snapshot(),state=copy.deepcopy(state),next_action=action,proposal=dict(accepted=accepted,rejected=rejected,visible=visible))
         trace.append(record);errors+=record['policy_errors']
         if action is None:break

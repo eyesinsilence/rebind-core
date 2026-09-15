@@ -68,3 +68,22 @@ python scripts/run_final_plan.py --help
 核心算子沿用已运行的项目实现。导出时移除了服务器专用路径，补充了安装元数据，并让缺少外部依赖的测试明确跳过。没有将历史 Git 仓库或其数据文件带入此仓库。
 
 这是研究实现，代码可运行不等于已经证明方法优于基线；本仓库不附带性能或机制验证结论。
+
+## 第一阶段：公共前端执行修复
+
+`final_frontend.py` 的执行版本为 `action_bound_literal_provenance_v2`。JSON、BP 和 ReBind 共享这套前端：
+
+- 每次检索动作携带 `slot_id`、`input_values` 和调度时的 `evidence_version`。检索后优先按该动作的真实输入抽取，再处理保留绑定中的其他不同输入组合。
+- 抽取任务采用当前可见证据版本。相同任务和相同证据只尝试一次；新证据可触发新的抽取。每个关系与输入组合最多发起一次定向检索，总检索预算仍由原配置限制。
+- 轨迹分别记录 `retrieval_attempt`、`extraction_tasks.completed`、`produced_candidates`；成功返回空候选不作为抽取失败。多分支抽取可能增加生成调用，需要在真实实验中单独计量。
+- 检索候选必须在其引用片段中出现，输入需出现在引用或标题上下文中。`literal_provenance` 仅表示通过字面核验，`relation_checked=False`，不会自动获得语义 `verified`。关系、方向和作用域保存在 `relation_claim` 中，但本阶段没有引入语义关系验证器。
+- 未改变神经网络方程、参数形状或训练损失。新前端产生的候选与轨迹不同，历史锁定评测结果不能作为新版本结果复用。
+
+运行定向回归与无标签轨迹审计：
+
+```bash
+python -m pytest tests/test_frontend_execution.py -q
+python scripts/audit_frontend_execution.py /path/to/full_trace.json
+```
+
+轨迹审计只检查执行一致性；无法从未带标签的轨迹推断正确候选覆盖率、真实纠正事件或 QA 增益。后续解码复核、来源聚合、门控和重新训练属于独立阶段。
