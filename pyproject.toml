@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rebind-core"
+version = "0.1.0"
+description = "Core ReBind RAG implementation and reference tests"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "numpy>=1.24",
+  "transformers>=4.45,<5",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+experiments = ["pyarrow>=14", "psutil>=5", "matplotlib>=3.7"]
+
+[project.scripts]
+rebind = "rebind_mvp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

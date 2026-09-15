@@ -1,0 +1,54 @@
+# Local environment and credentials
+.venv/
+venv/
+.env
+.env.*
+*.pem
+*.key
+.ssh/
+
+# Generated Python files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Research data, downloaded dependencies and experiment outputs
+data/
+datasets/
+assets/
+models/
+checkpoints/
+upstream/
+external_runs/
+runs/
+reports/
+manifests/
+outputs/
+configs/resolved.yaml
+requirements.lock.txt
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.jsonl
+*.csv
+*.tsv
+*.log
+*.zip
+*.tar
+*.gz
+
+# Local tooling
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
